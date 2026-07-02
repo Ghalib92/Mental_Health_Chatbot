@@ -3,9 +3,9 @@ Retrieval-Augmented Generation pipeline for the mental-health assistant.
 
 Design notes (what makes this "proper" RAG rather than a toy):
 
-* Lazy + cached  - the chain is built on first use, so the Django app and its
-  tests boot without the heavy ML deps or API keys. Misconfiguration surfaces
-  as ChatbotUnavailable -> a clean HTTP 503.
+* Lazy + cached  - the chain is built on first use and memoised. Missing ML
+  deps or API keys never crash startup: they surface as ChatbotUnavailable ->
+  a clean HTTP 503.
 * Chat model     - uses ChatOpenAI (gpt-4o-mini) instead of the legacy
   completion endpoint.
 * History-aware  - follow-up questions are reformulated into standalone queries
@@ -19,10 +19,33 @@ Design notes (what makes this "proper" RAG rather than a toy):
   product; deterministic safety beats a generated answer.
 """
 
+import os
 import re
 from functools import lru_cache
 
 from django.conf import settings
+
+# Heavy, optional ML stack. Imported at module load for a clean, organized
+# top-level import block, but kept non-fatal: if these (or their transitive
+# deps) are missing, the app still boots and the chatbot degrades to a clean
+# 503 via ChatbotUnavailable instead of crashing Django on startup.
+try:
+    from langchain.chains import (
+        create_history_aware_retriever,
+        create_retrieval_chain,
+    )
+    from langchain.chains.combine_documents import create_stuff_documents_chain
+    from langchain_core.messages import AIMessage, HumanMessage
+    from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+    from langchain_openai import ChatOpenAI
+    from langchain_pinecone import PineconeVectorStore
+
+    from src.helper import download_hugging_face_embeddings
+    from src.prompt import contextualize_q_system_prompt, system_prompt
+
+    _IMPORT_ERROR = None
+except ImportError as exc:  # pragma: no cover - optional ML deps
+    _IMPORT_ERROR = exc
 
 
 class ChatbotUnavailable(Exception):
@@ -69,28 +92,16 @@ def detect_crisis(message: str) -> bool:
 # --------------------------------------------------------------------------- #
 @lru_cache(maxsize=1)
 def _build_chain():
+    if _IMPORT_ERROR is not None:  # pragma: no cover - optional ML deps
+        raise ChatbotUnavailable(
+            f"Chatbot dependencies are not installed: {_IMPORT_ERROR}"
+        ) from _IMPORT_ERROR
+
     if not settings.OPENAI_API_KEY or not settings.PINECONE_API_KEY:
         raise ChatbotUnavailable(
             "Chatbot is not configured. Set OPENAI_API_KEY and PINECONE_API_KEY, "
             "and build the index with `python store_index.py`."
         )
-
-    try:
-        import os
-
-        from langchain.chains import (
-            create_history_aware_retriever,
-            create_retrieval_chain,
-        )
-        from langchain.chains.combine_documents import create_stuff_documents_chain
-        from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-        from langchain_openai import ChatOpenAI
-        from langchain_pinecone import PineconeVectorStore
-
-        from src.helper import download_hugging_face_embeddings
-        from src.prompt import contextualize_q_system_prompt, system_prompt
-    except ImportError as exc:  # pragma: no cover - optional ML deps
-        raise ChatbotUnavailable(f"Chatbot dependencies are not installed: {exc}") from exc
 
     os.environ["OPENAI_API_KEY"] = settings.OPENAI_API_KEY
     os.environ["PINECONE_API_KEY"] = settings.PINECONE_API_KEY
@@ -127,8 +138,6 @@ def _build_chain():
 
 def _to_messages(history):
     """Convert [{'role': 'user'|'assistant', 'content': ...}] to LC messages."""
-    from langchain_core.messages import AIMessage, HumanMessage
-
     messages = []
     for turn in history or []:
         role, content = turn.get("role"), turn.get("content", "")
